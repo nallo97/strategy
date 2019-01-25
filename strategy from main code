@@ -1,0 +1,941 @@
+"use strict"
+import {BCAbstractRobot, SPECS} from 'battlecode';
+
+let step = -1;
+const TRAFFIC_PREVENTION = 25;
+// for knowing where the castles are
+let castle_map = null; 
+let castles = [];
+let enemy_castle_map = null;
+let enemy_castles = [];
+let broadcast = null;
+let castle_talk = null;
+let logger = null;
+// Unit Classes
+class Pilgrim {
+    constructor(self, map) {
+	this.movement_choices = generate_choices(4);
+	this.vision_choices = generate_choices(100);
+
+	this.updated_castles = {};
+	this.destination_map = create_empty_map(map.length, map[0].length);
+	this.destination = null;
+	this.collecting = false;
+    }
+
+    execute(self, map) {
+	if (!this.listening(self))
+	    return this.gather(self, map);
+    }
+
+    // whether robot is listening for signals from this robot
+    listening(self, robot) {
+	return this.destination === null && (!robot || robot.unit === SPECS.CASTLE);
+    }
+
+    // recieve a signal, which is the place we're going to mine
+    recieve(self, signal, robot) {
+	const pos = pilgrim_signalToPos(signal);
+	this.destination = pos;
+	self.log("Going to mine at: " + pos);
+	this.destination_map[pos[1]][pos[0]] = true;
+	this.kCollector = at(this.destination_map, pos);
+	this.fCollector = at(this.destination_map, pos);
+	this.collecting = true;
+    }
+
+    move(self, map, dest) {
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+	let next_move = bfs(map, this.movement_choices, self.fuel, [x, y], dest);
+	if (next_move != null)
+	    return self.move(...next_move);
+    }
+
+    full(self) {
+	return (this.kCollector && self.me.karbonite === 20) 
+	    || (this.fCollector && self.me.fuel === 100);
+    }
+
+    gather(self, map) {
+	// Obtain resources
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+	// if we're not collecting, and we're at the castle, give what we can
+	if (!this.collecting && at(castle_map, pos)) {
+//	    self.log("Giving");
+	    for (let robot of self.getVisibleRobots()) {
+		if (!self.isVisible(robot))
+		    continue;
+
+		if (robot.unit === SPECS.CASTLE && robot.team == self.me.team) {
+		    const [dx, dy] = [robot.x - x, robot.y - y];
+		    this.collecting = true;
+		    return self.give(dx, dy, self.me.karbonite, self.me.fuel);
+		}
+	    }
+	} else if (this.collecting && at(this.destination_map, pos) && !this.full(self)) {
+//	    self.log("Mining assigned location");
+	    return self.mine();
+	} else if (at(self.karbonite_map, pos) && self.me.karbonite !== 20) {
+//	    self.log("Mining karbonite");
+	    return self.mine();
+	} else if (at(self.fuel_map, pos) && self.me.fuel !== 100) {
+//	    self.log("Mining assigned fuel");
+	    return self.mine();
+	} else if (at(this.destination_map, pos) && this.full(self)) {
+//	    self.log("Full, returning");
+	    this.collecting = false;
+	    return this.move(self, map, castle_map);
+	} else if (this.collecting) {
+//	    self.log("Moving to resource...");
+	    return this.move(self, map, this.destination_map);
+	} else {
+//	    self.log("Moving to castle...");
+	    return this.move(self, map, castle_map);
+	}
+    }
+}
+
+class AttackUnit {
+    constructor(self, map, stats) {
+	this.to_be_seen = create_empty_map(map.length, map[0].length, true);
+	this.movement_choices = generate_choices(stats.movement_speed);
+	this.attack_choices = generate_choices(stats.attack_max);
+	this.vision_choices = generate_choices(stats.vision_radius);
+	this.movement_cost = stats.movement_cost;
+	this.attack_min = stats.attack_min;
+	this.attack_max = stats.attack_max;
+	this.attack_cost = stats.attack_cost;
+	this._listening = true;
+	this._begin_attack = false;
+    }
+
+    execute(self, map) {
+	// update enemy castle existance from our position
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+
+	// if we're at a place where we think there should be a castle,
+	// check to see if it was destroyed
+	if (at(enemy_castle_map, pos)) {
+	    let castle_dead = true;
+	    for (let robot of self.getVisibleRobots()) {
+		if (!self.isVisible(robot))
+		    continue;
+
+		if (robot.unit === SPECS.CASTLE && robot.team !== self.me.team) {
+		    castle_dead = false;
+		    break;
+		}
+	    }
+
+	    if (castle_dead) {
+		const to_remove = [];
+		for (let choice of this.vision_choices) {
+		    const npos = move(pos, choice);
+		    if (!valid(map, npos))
+			continue;
+
+		    if (containsPos(enemy_castles, npos))
+			to_remove.push(npos);
+		    enemy_castle_map[npos[1]][npos[0]] = false;
+		}
+
+		const valid_castles = [];
+		for (let castle of enemy_castles)
+		    if (!containsPos(to_remove, castle))
+			valid_castles.push(castle);
+		enemy_castles = valid_castles;
+	    }
+	}
+
+	// only begin moving once we haven't received any more mesages and we aren't listening
+	if (!this.listening(self)) {
+	    if (this._attack) {
+		if (enemy_castles.length > 0)
+		    return this.attack(self, map)
+		else
+		    return this.explore(self, map);
+	    } else 
+		return this.defend(self);
+	} else
+	    // play defense
+	    return this.defend(self);
+    }
+
+    defend(self) {
+	if (self.fuel <= this.attack_cost)
+	    return;
+
+	const [x, y] = [self.me.x, self.me.y];
+	for (let robot of self.getVisibleRobots()) {
+	    if (!self.isVisible(robot))
+		continue;
+
+	    const [dx, dy] = [robot.x - x, robot.y - y];
+	    if (robot.team !== self.me.team 
+		&& dx*dx + dy*dy >= this.attack_min
+		&& dx*dx + dy*dy <= this.attack_max)
+		return self.attack(dx, dy); 
+	}
+    }
+
+    listening(self, robot) {
+	return this._listening && (!robot || robot.unit === SPECS.CASTLE);
+    }
+
+    recieve(self, signal, robot) {
+	if (!this.listening(self, robot))
+	    return;
+
+	const [forAttackUnit, pos, attack, isLastPosition] = attackUnit_signalToPos(signal);
+	if (!forAttackUnit)
+	    return;
+
+	if (attack) {
+	    this._attack = true;
+	    this._listening = false;
+	    return;
+	}
+
+	if (!valid(self.map, pos) || !at(self.map, pos))
+	    self.log("Signal invalid..." + valid(self.map, pos) + " " + at(self.map, pos));
+	else {
+	    enemy_castles.push(pos);
+	    for (let choice of this.attack_choices) {
+		const npos = move(pos, choice);
+		if (valid(self.map, npos))
+		    enemy_castle_map[npos[1]][npos[0]] = true;
+	    }
+	}
+    }
+
+    attack(self, map) {
+	let [x, y] = [self.me.x, self.me.y];
+	let pos = [x, y];
+	if (self.fuel > this.attack_cost * 2) {
+	    // Attack any enemy robots if possible
+	    for (let robot of self.getVisibleRobots()) {
+		if (!self.isVisible(robot))
+		    continue;
+
+		let [dx, dy] = [robot.x - x, robot.y - y];
+		if (robot.team !== self.me.team 
+		    && dx*dx + dy*dy >= this.attack_min
+		    && dx*dx + dy*dy <= this.attack_max)
+		    return self.attack(dx, dy);
+	    }
+	}
+
+	let next_move = bfs(map, 
+	    this.movement_choices, 
+	    self.fuel / this.movement_cost, 
+	    pos, 
+	    enemy_castle_map);
+	if (next_move !== null)
+	    return self.move(...next_move);
+    }
+
+    
+    explore(self, map) {
+	let [x, y] = [self.me.x, self.me.y];
+	let pos = [x, y];
+	if (self.fuel >= this.attack_cost * 2) {
+	    // Attack any enemy robots if possible
+	    for (let robot of self.getVisibleRobots()) {
+		if (!self.isVisible(robot))
+		    continue;
+
+		let [dx, dy] = [robot.x - x, robot.y - y];
+		if (robot.team !== self.me.team
+		    && dx*dy + dy*dy >= this.attack_min
+		    && dx*dy + dy*dy <= this.attack_max)
+		    return self.attack(dx, dy);
+	    }
+	}
+
+	for (let choice of this.vision_choices) {
+	    const vpos = move(pos, choice);
+	    if (valid(map, vpos))
+		this.to_be_seen[vpos[1]][vpos[0]] = false;
+	}
+
+	let next_move = bfs(map, this.movement_choices, self.fuel, pos, this.to_be_seen);
+	if (next_move !== null)
+	    return self.move(...next_move);
+    }
+}
+
+class Crusader {
+    constructor(self, map) {
+	this.to_be_seen = create_empty_map(map.length, map[0].length, true);
+	this.movement_choices = generate_choices(9);
+	this.attack_choices = generate_choices(16);
+	this.vision_choices = generate_choices(49);
+	this._listening = true;
+	this._begin_attack = false;
+    }
+
+    execute(self, map) {
+	// update enemy castle existance from our position
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+
+	// if we're at a place where we think there should be a castle,
+	// check to see if it was destroyed
+	if (at(enemy_castle_map, pos)) {
+	    let castle_dead = true;
+	    for (let robot of self.getVisibleRobots()) {
+		if (!self.isVisible(robot))
+		    continue;
+
+		if (robot.unit === SPECS.CASTLE && robot.team !== self.me.team) {
+		    castle_dead = false;
+		    break;
+		}
+	    }
+
+	    if (castle_dead) {
+		const to_remove = [];
+		for (let choice of this.vision_choices) {
+		    const npos = move(pos, choice);
+		    if (!valid(map, npos))
+			continue;
+
+		    if (containsPos(enemy_castles, npos))
+			to_remove.push(npos);
+		    enemy_castle_map[npos[1]][npos[0]] = false;
+		}
+
+		const valid_castles = [];
+		for (let castle of enemy_castles)
+		    if (!containsPos(to_remove, castle))
+			valid_castles.push(castle);
+		enemy_castles = valid_castles;
+	    }
+	}
+
+	// only begin moving once we haven't received any more mesages and we aren't listening
+	if (!this.listening(self)) {
+	    if (this._attack) {
+		if (enemy_castles.length > 0)
+		    return this.attack(self, map)
+		else
+		    return this.explore(self, map);
+	    } else 
+		return this.defend(self);
+	} else
+	    // play defense
+	    return this.defend(self);
+    }
+
+    defend(self) {
+	const [x, y] = [self.me.x, self.me.y];
+	for (let robot of self.getVisibleRobots()) {
+	    if (!self.isVisible(robot))
+		continue;
+
+	    const [dx, dy] = [robot.x - x, robot.y - y];
+	    if (robot.team !== self.me.team && dx*dx + dy*dy <= 16)
+		return self.attack(dx, dy);
+	}
+    }
+
+    listening(self, robot) {
+	return this._listening && (!robot || robot.unit === SPECS.CASTLE);
+    }
+
+    recieve(self, signal, robot) {
+	if (!this.listening(self, robot))
+	    return;
+
+	let [pos, attack, isLastPosition] = attackUnit_signalToPos(signal);
+	if (attack) {
+	    this._attack = true;
+	    this._listening = false;
+	    return;
+	}
+
+	if (!valid(self.map, pos) || !at(self.map, pos))
+	    self.log("Signal invalid..." + valid(self.map, pos) + " " + at(self.map, pos));
+	else {
+	    enemy_castles.push(pos);
+	    for (let choice of this.attack_choices) {
+		const npos = move(pos, choice);
+		if (valid(self.map, npos))
+		    enemy_castle_map[npos[1]][npos[0]] = true;
+	    }
+	}
+    }
+
+    attack(self, map) {
+	let [x, y] = [self.me.x, self.me.y];
+	let pos = [x, y];
+	// Attack any enemy robots if possible
+	for (let robot of self.getVisibleRobots()) {
+	    if (!self.isVisible(robot))
+		continue;
+
+	    let [dx, dy] = [robot.x - x, robot.y - y];
+	    if (robot.team !== self.me.team && dx*dx + dy*dy <= 16)
+		return self.attack(dx, dy);
+	}
+
+	let next_move = bfs(map, this.movement_choices, self.fuel, pos, enemy_castle_map);
+	if (next_move !== null)
+	    return self.move(...next_move);
+    }
+
+    
+    explore(self, map) {
+	let [x, y] = [self.me.x, self.me.y];
+	let pos = [x, y];
+	// Attack any enemy robots if possible
+	for (let robot of self.getVisibleRobots()) {
+	    if (!self.isVisible(robot))
+		continue;
+
+	    let [dx, dy] = [robot.x - x, robot.y - y];
+	    if (robot.team !== self.me.team && dx*dx + dy*dy <= 16)
+		return self.attack(dx, dy);
+	}
+
+	for (let choice of this.vision_choices) {
+	    const vpos = move(pos, choice);
+	    if (valid(map, vpos))
+		this.to_be_seen[vpos[1]][vpos[0]] = false;
+	}
+
+	let next_move = bfs(map, this.movement_choices, self.fuel, pos, this.to_be_seen);
+	if (next_move !== null)
+	    return self.move(...next_move);
+    }
+}
+
+class Castle {
+    constructor(self, map) {
+	this.build_choices = generate_choices(2);
+
+	this.pilgrimBuilt = 0;
+	this.totalPilgrimsBuilt = 0;
+	this.crusadersBuilt = 0;
+	this.lastCrusaderBuilt = null;
+
+	this.castleTalk = {};
+
+	const [h, w] = [map.length, map[0].length];
+	const [x, y] = [self.me.x, self.me.y];
+	if (isVerticallySymmetric(map))
+	    enemy_castles.push([x, h - y - 1]);
+	else
+	    enemy_castles.push([w - x - 1, y]);
+
+	const epos = enemy_castles[0];
+	castle_talk.push(epos[0]);
+	castle_talk.push(epos[1]);
+	this.kMap = resource_list(self.map, this.build_choices, [x, y], self.karbonite_map);
+	this.kIndex = 0;
+	this.fMap = resource_list(self.map, this.build_choices, [x, y], self.fuel_map);
+	this.fIndex = 0;
+    }
+
+    // whether robot is listening for signals from this robot
+    listening(self, robot) {
+	return robot.unit === SPECS.PILGRIM;
+    }
+
+    // recieve a signal and do something with it
+    recieve(self, signal, robot) {
+	const newPosition = pilgrim_signalToPos(signal);
+	if (!containsPos(enemy_castles, newPosition))
+	    enemy_castles.push(newPosition);
+    }
+
+    // see if we've received any new enemy castle position information
+    handleCastleTalk(self) {
+	for (let robot of self.getVisibleRobots()) {
+	    if (robot.team === self.me.team && robot.castle_talk) {
+		if (this.castleTalk[robot.id] === undefined)
+		    this.castleTalk[robot.id] = [];
+
+		this.castleTalk[robot.id].push(decodeCastleTalk(robot.castle_talk));
+		if (this.castleTalk[robot.id].length == 2) {
+		    const pos = this.castleTalk[robot.id];
+		    if (!containsPos(enemy_castles, pos))
+			enemy_castles.push(pos);
+
+		    this.castleTalk[robot.id] = undefined;
+		}
+	    }
+	}
+    }
+
+    buildPilgrim(self, map, offset) {
+	const bPos = move([self.me.x, self.me.y], offset);
+	if (self.karbonite > 10 && self.fuel > 50 && at(map, bPos)) {
+	    ++this.pilgrimBuilt;
+	    ++this.totalPilgrimsBuilt;
+	    this.kIndex %= this.kMap.length;
+	    this.fIndex %= this.fMap.length;
+	    let signal = null;
+	    // focus on fuel sources
+	    if (this.fIndex <= this.kIndex * 1.5) 
+		signal = pilgrim_posToSignal(this.fMap[this.fIndex++]);
+	    else
+		signal = pilgrim_posToSignal(this.kMap[this.kIndex++]);
+	    self.log("Telling pilgrim to mine at: " + pilgrim_signalToPos(signal));
+	    broadcast = new Broadcast([signal], 2);
+
+	    return self.buildUnit(SPECS.PILGRIM, ...offset);
+	}
+    }
+
+    buildCrusader(self, map, offset) {
+	const bPos = move([self.me.x, self.me.y], offset);
+	if (self.karbonite > 15 && self.fuel > 50 && at(map, bPos)) {
+	    ++this.crusadersBuilt;
+	    let signals = [];
+	    if (enemy_castles.length > 0) {
+		for (let i = 0; i < enemy_castles.length - 1; ++i)
+		    signals.push(attackUnit_posToSignal(enemy_castles[i], false, false));
+		signals.push(
+		    attackUnit_posToSignal(enemy_castles[enemy_castles.length - 1], false, true)
+		);
+		broadcast = new Broadcast(signals, 2);
+	    }
+	    return self.buildUnit(SPECS.CRUSADER, ...offset);
+	}
+    }
+
+    buildProphet(self, map, offset) {
+	const bPos = move([self.me.x, self.me.y], offset);
+	if (self.karbonite > 25 && self.fuel > 50 && at(map, bPos)) {
+	    ++this.crusadersBuilt;
+	    let signals = [];
+	    if (enemy_castles.length > 0) {
+		for (let i = 0; i < enemy_castles.length - 1; ++i)
+		    signals.push(attackUnit_posToSignal(enemy_castles[i], false, false));
+		signals.push(
+		    attackUnit_posToSignal(enemy_castles[enemy_castles.length - 1], false, true)
+		);
+		broadcast = new Broadcast(signals, 2);
+	    }
+	    return self.buildUnit(SPECS.PROPHET, ...offset);
+	}
+    }
+
+    getAttacker(self) {
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+
+	let attacker = null;
+	for (let robot of self.getVisibleRobots())
+	    if (self.isVisible(robot) && robot.team !== self.me.team) {
+		const [dx, dy] = [robot.x - x, robot.y - y];	
+		if (dx*dx + dy*dy <= 64) {
+		    attacker = robot;
+		    break;
+		}
+	    }
+
+	return attacker;
+    }
+
+
+    defendCastle(self, enemy) {
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+
+	if (enemy !== null) {
+	    const [dx, dy] = [enemy.x - x, enemy.y - y];	
+	    return self.attack(dx, dy);
+	}
+    }
+
+    execute(self, map) {
+	this.handleCastleTalk(self);
+
+	const [x, y] = [self.me.x, self.me.y];
+	const pos = [x, y];
+	const attacker = this.getAttacker(self);
+
+	if (step % 5 == 0) {
+	    let builder = this.buildCrusader.bind(this);
+	    if ((this.pilgrimBuilt > 0 && this.pilgrimBuilt % 3 === 0) 
+		|| this.totalPilgrimsBuilt > 10) {
+		this.pilgrimBuilt = 0;
+//		builder = (this.pilgrimBuilt % 2 == 0) ? 
+//		    this.buildCrusader.bind(this) : this.buildProphet.bind(this);
+		builder = this.buildProphet.bind(this);
+	    } else {
+		// if we're being attacked, don't build a pilgrim, attack the unit
+		if (attacker !== null && attacker.unit !== SPECS.PILGRIM)
+		    return this.defendCastle(self, attacker);
+
+		builder = this.buildPilgrim.bind(this);
+	    }
+
+	    for (let choice of this.build_choices) {
+		let npos = move(pos, choice);
+		if (valid(map, npos) && at(map, npos))
+		    return builder(self, map, choice);
+	    }
+	} else {
+	    let nAttackUnits = 0;
+	    // count how many attack units we have; if we have more than 3, attack
+	    let radius = 0;
+	    for (let robot of self.getVisibleRobots()) {
+		if (!self.isVisible(robot))
+		    continue;
+
+		const [dx, dy] = [robot.x - x, robot.y - y];
+		if (robot.team === self.me.team 
+		    && (robot.unit === SPECS.CRUSADER || robot.unit === SPECS.PROPHET)) {
+		    ++nAttackUnits;
+		    radius = (radius < dx*dx + dy*dy) ? dx*dx + dy*dy : radius;
+		}
+	    }
+
+	    if (nAttackUnits > 3) {
+		broadcast = new Broadcast([attackUnit_posToSignal([0, 0], true, true)], radius);
+		return broadcast.broadcast(self);
+	    }
+
+	    return this.defendCastle(self, attacker);
+	}
+    }
+}
+
+var unit = null;
+class MyRobot extends BCAbstractRobot {
+    turn() {
+        step++;
+	logger = this;
+	// safe guard
+	if (this.me.time < 20)
+	    return;
+
+	if (unit === null) {
+	    let map = clone_map(this.map);
+
+	    castle_map = create_empty_map(this.map.length, this.map[0].length, false);
+	    enemy_castle_map = create_empty_map(this.map.length, this.map[0].length, false);
+	    castle_talk = new CastleTalk();
+	    switch (this.me.unit) {
+		case SPECS.PILGRIM:
+		    unit = new Pilgrim(this, map);
+		    break;
+		case SPECS.CRUSADER:
+		    unit = new AttackUnit(this, 
+			map, 
+			{
+			    movement_speed: 9,
+			    movement_cost: 1,
+			    vision_radius: 49,
+			    attack_min: 1,
+			    attack_max: 16,
+			    attack_cost: 10
+			});
+		    break;
+		case SPECS.PROPHET:
+		    unit = new AttackUnit(this, 
+			map, 
+			{
+			    movement_speed: 4,
+			    movement_cost: 2,
+			    vision_radius: 64,
+			    attack_min: 16,
+			    attack_max: 64,
+			    attack_cost: 25
+			});
+		    break;
+			    //77777777777777777777for the preacher
+		case SPECS.PREACHER:
+		    unit = new AttackUnit(this, 
+			map, 
+			{
+			    movement_speed: 4,
+			    movement_cost: 3,
+			    vision_radius: 16,
+			    attack_min: 1,
+			    attack_max: 16,
+			    attack_cost: 15
+			});
+		    break;
+		case SPECS.CASTLE:
+		    unit = new Castle(this, map);
+		    break;
+	    }
+	}
+
+	castle_talk.talk(this);
+
+	// See if we need to broadcast anything
+	if (broadcast !== null && !broadcast.finished())
+	    return broadcast.broadcast(this);
+
+	// see whether we need to listen to anything
+	for (let robot of this.getVisibleRobots())
+	    if (robot.team == this.me.team 
+		&& this.isRadioing(robot)
+		&& unit.listening(this, robot))
+		unit.recieve(this, robot.signal, robot);
+        
+        let map = clone_map(this.map);
+        for (let robot of this.getVisibleRobots()) {
+	    if (!this.isVisible(robot))
+		continue;
+
+            // robot is a castle 
+            if (robot.unit == SPECS.CASTLE) {
+		if (robot.team == this.me.team) {
+		    updateCastleMap(castle_map, [robot.x, robot.y]);
+		    castles.push([robot.x, robot.y]);
+		} else if (robot.team != this.me.team) {
+		    updateCastleMap(enemy_castle_map, [robot.x, robot.y]);
+		    if (!containsPos(enemy_castles, [robot.x, robot.y])) {
+			enemy_castles.push([robot.x, robot.y]);
+			castle_talk.push(robot.y);
+			castle_talk.push(robot.x);
+		    }
+		}
+	    }
+
+            map[robot.y][robot.x] = false;
+        }
+
+	return unit.execute(this, map);
+    }
+}
+
+var robot = new MyRobot();
+// Helper Classes
+class Broadcast {
+    constructor(signals, radius) {
+	this.signals = signals;
+	this.radius = radius;
+	this.index = 0;
+    }
+
+    finished() {
+	return this.index >= this.signals.length;
+    }
+
+    broadcast(self) {
+	if (this.index < this.signals.length)
+	    return self.signal(this.signals[this.index++], this.radius);
+    }
+}
+
+class CastleTalk {
+    constructor() {
+	this.toSend = [];
+    }
+
+    push(value) {
+	this.toSend.push((value << 1) | 1);
+    }
+
+    talk(self) {
+	if (this.toSend.length > 0)
+	    return self.castleTalk(this.toSend.shift());
+    }
+}
+
+// Helper functions:
+// checks whether an index is valid in a map
+function valid(map, pos) {
+    const [x, y] = pos;
+    const length = map.length;
+    const width = map[0].length;
+    return x >= 0 && y >= 0 && x < width && y < length;
+}
+
+// given a position [x, y] and a move [dx, dy], it returns the new position after the move
+function move(pos, step) {
+    return [pos[0] + step[0], pos[1] + step[1]];
+}
+
+// given a map and a position [x, y], it returns the item at the map position [x, y]
+function at(map, pos) {
+    const [x, y] = pos;
+    return map[y][x];
+}
+
+function poseq(p1, p2) {
+    return p1[0] == p2[0] && p1[1] == p2[1];
+}
+
+function create_empty_map(length, width, value) {
+    let map = new Array(length);
+    for (let i = 0; i < length; ++i) {
+        let row = new Array(width);
+        for (let j = 0; j < row.length; ++j)
+            row[j] = value;
+        map[i] = row;
+    }
+        
+    return map;
+}
+
+function clone_map(map) {
+    let clone = new Array(map.length);
+    for (let i = 0; i < map.length; ++i)
+        clone[i] = map[i].slice(0);
+        
+    return clone;
+}
+
+// map is a 2D array containg whether areas are passable
+// start is the current position of the robot
+// endings is a 2D array containing the desired ending positions of the robot
+// the function returns the next step
+// example usage: bfs(map, [x, y], karbonite_map)
+function bfs(map, choices, fuel, start, endings) {
+    // initialize grid of visited items
+    let visited = create_empty_map(map.length, map[0].length);
+    visited[start[1]][start[0]] = true
+    choices = choices.filter(m => m[0]*m[0] + m[1]*m[1] < fuel);
+
+    // eventually we might want to use an actual queue as it may be more effiiecnt
+    // queue.shift() might be O(n)
+    // further optimization: we don't need the next path, only the first move
+    // so store only the first move and the current move
+    let queue = [];
+    // initialize queue, and remember what was our initial movement choice
+    for (let choice of choices) {
+	let mpos = move(start, choice);
+	if (valid(map, mpos) && !at(visited, mpos) && at(map, mpos)) {
+	    let [mx, my] = mpos;
+	    visited[my][mx] = true;
+	    queue.push({move: choice, pos: mpos});
+	}
+    }
+
+    while (queue.length > 0) {
+	let current = queue.shift();
+	let pos = current.pos;
+	if (at(endings, pos))
+	    return current.move;
+
+	for (let choice of choices) {
+	    let mpos = move(pos, choice);
+	    if (valid(map, mpos) && !at(visited, mpos) && at(map, mpos)) {
+		let [mx, my] = mpos;
+		visited[my][mx] = true;
+		queue.push({move: current.move, pos: mpos});
+	    }
+	}
+    }
+
+    return null;
+}
+
+function resource_list(map, choices, start, endings) {
+    // initialize grid of visited items
+    const visited = create_empty_map(map.length, map[0].length);
+    visited[start[1]][start[0]] = true
+
+    // eventually we might want to use an actual queue as it may be more effiiecnt
+    // queue.shift() might be O(n)
+    // further optimization: we don't need the next path, only the first move
+    // so store only the first move and the current move
+    const queue = [start];
+
+    const ret = [];
+    while (queue.length > 0) {
+	const pos = queue.shift();
+	if (at(endings, pos)) {
+	    console.log(pos);
+	    ret.push(pos);	
+	}
+
+	for (let choice of choices) {
+	    let mpos = move(pos, choice);
+	    if (valid(map, mpos) && !at(visited, mpos) && at(map, mpos)) {
+		let [mx, my] = mpos;
+		visited[my][mx] = true;
+		queue.push(mpos);
+	    }
+	}
+    }
+
+    return ret;
+}
+
+// generates the choices for a certain radius
+function generate_choices(rsq) {
+    // simple but correct generate_choices for now
+    let choices = [];
+    for (let i = -rsq; i <= rsq; ++i)
+	for (let j = -rsq; j <= rsq; ++j)
+		if (i*i + j*j <= rsq)
+		    choices.push([i, j])
+    return choices;
+}
+
+function containsPos(list, pos) {
+    for (let p of list)
+	if (p[0] == pos[0] && p[1] == pos[1])
+	    return true;
+
+    return false;
+}
+
+function pilgrim_posToSignal(pos) {
+    return (pos[0] << 6) | pos[1];
+}
+
+function pilgrim_signalToPos(signal) {
+    const x = signal >> 6;
+    const y = signal & 0x3F;
+    return [x, y];
+}
+
+function attackUnit_posToSignal(pos, attack, isLastPos) {
+    return (isLastPos << 15) | (attack << 14) | (1 << 13) | (pos[0] << 6) | pos[1];
+}
+
+function attackUnit_signalToPos(signal) {
+    const isLastPos = signal >> 15;
+    const attack = (signal >> 14) & 1;
+    const forAttackUnit = (signal >> 13) & 1;
+    const x = (signal >> 6) & 0x3F;
+    const y = signal & 0x3F;
+    return [forAttackUnit, [x, y], attack, isLastPos];
+}
+
+function visitedAll(to_be_seen) {
+    for (let i = 0; i < to_be_seen.length; ++i)
+	for (let j = 0; j < to_be_seen[0].length; ++j)
+	    if (to_be_seen[i][j])
+		return false;
+
+    return true;
+}
+
+function isVerticallySymmetric(map) {
+    const length = map.length;
+    const l = Math.floor(length / 2);
+    for (let i = 0; i < l; ++i)
+	for (let j = 0; j < map[0].length; ++j)
+	    if (map[i][j] !== map[length - i - 1][j])
+		return false;
+
+    return true;
+}
+
+function decodeCastleTalk(value) {
+    return (value >> 1);
+}
+
+function updateCastleMap(castle_map, pos) {
+    const choices = [[0,-1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1]];
+
+    for (let choice of choices) {
+	const npos = move(pos, choice);
+	if (valid(castle_map, npos))
+	    castle_map[npos[1]][npos[0]] = true;
+    }
+}
